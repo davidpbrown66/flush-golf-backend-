@@ -5,7 +5,7 @@ const app = express();
 app.use(express.json());
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const SERVER_SECRET = process.env.SERVER_SECRET;
+const SERVER_SECRET = process.env.BACKEND_TOKEN;
 const MODEL = 'claude-haiku-4-5-20251001';
 
 // ── Auth middleware ──────────────────────────────────────────────────────────

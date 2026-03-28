@@ -157,4 +157,7 @@ Respond with exactly 5 insights, numbered 1-5, each on a new line. No headers.`;
 
 // ── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Flush Golf backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Flush Golf backend running on port ${PORT}`);
+  console.log(`SERVER_SECRET set: ${!!process.env.SERVER_SECRET}`);
+});

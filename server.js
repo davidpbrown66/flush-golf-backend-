@@ -96,7 +96,10 @@ app.get('/api/courses/:id/holes', async (req, res) => {
       return res.status(404).json({ error: 'Course not found' });
     }
 
-    const courseData = await gcaRes.json();
+    const rawCourse = await gcaRes.json();
+    // GolfCourseAPI may wrap the course in a "course" key — handle both formats.
+    const courseData = rawCourse.course || rawCourse;
+    console.log('GCA course keys:', Object.keys(courseData));
     const lat = courseData.location?.latitude;
     const lng = courseData.location?.longitude;
 

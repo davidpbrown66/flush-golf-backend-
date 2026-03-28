@@ -6,11 +6,10 @@ app.use(express.json());
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const SERVER_SECRET = process.env.BACKEND_TOKEN;
+const GOLFCOURSE_API_KEY = process.env.GOLFCOURSE_API_KEY;
 const MODEL = 'claude-haiku-4-5-20251001';
 
 // ── Auth middleware ──────────────────────────────────────────────────────────
-// Rejects any request that doesn't include the correct Bearer token.
-// This prevents the public from abusing your Anthropic API key.
 function requireAuth(req, res, next) {
   const auth = req.headers['authorization'];
   if (!auth || auth !== `Bearer ${SERVER_SECRET}`) {
@@ -24,13 +23,238 @@ app.use(requireAuth);
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// ── POST /api/insights ────────────────────────────────────────────────────────
-// Generates 3 post-round coaching points based on hole scores.
-// Called by the app after a round is marked is_complete = true.
+// ── GET /api/courses/search ───────────────────────────────────────────────────
+// Searches GolfCourseAPI for courses matching the query string.
+// Returns a list of courses with id, name, location.
+// The iOS app uses this to let the user pick their course before a round.
 //
-// Request body:
-//   holes: array of { holeNumber, par, score, putts, fairwayHit, gir, approachX, approachY, approachDist }
-//   handicap: number (optional)
+// Query params:
+//   q: string — course or club name to search
+app.get('/api/courses/search', async (req, res) => {
+  const { q } = req.query;
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ error: 'q parameter required (min 2 chars)' });
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.golfcourseapi.com/v1/search?search_query=${encodeURIComponent(q.trim())}`,
+      { headers: { 'Authorization': `Key ${GOLFCOURSE_API_KEY}` } }
+    );
+
+    if (!response.ok) {
+      console.error('GolfCourseAPI search error:', response.status);
+      return res.status(502).json({ error: 'Course search failed' });
+    }
+
+    const data = await response.json();
+
+    // Return a trimmed list — just what the iOS picker needs
+    const courses = (data.courses || []).map(c => ({
+      id:         c.id,
+      clubName:   c.club_name,
+      courseName: c.course_name,
+      location: {
+        address:   c.location?.address,
+        city:      c.location?.city,
+        state:     c.location?.state,
+        country:   c.location?.country,
+        latitude:  c.location?.latitude,
+        longitude: c.location?.longitude,
+      }
+    }));
+
+    res.json({ courses });
+  } catch (err) {
+    console.error('/api/courses/search error:', err.message);
+    res.status(500).json({ error: 'Course search failed' });
+  }
+});
+
+// ── GET /api/courses/:id/holes ─────────────────────────────────────────────────
+// Returns full hole data for a course:
+//   - Par, yards, stroke index from GolfCourseAPI
+//   - Green polygon, front/centre/back coords, hazards from OpenStreetMap
+//
+// The iOS app caches this in Supabase after the first fetch.
+// During a live round, the app reads from Supabase only — this endpoint
+// is never called mid-round.
+app.get('/api/courses/:id/holes', async (req, res) => {
+  const courseId = parseInt(req.params.id, 10);
+  if (isNaN(courseId)) {
+    return res.status(400).json({ error: 'Invalid course id' });
+  }
+
+  try {
+    // ── Step 1: GolfCourseAPI — metadata ──────────────────────────────────────
+    const gcaRes = await fetch(
+      `https://api.golfcourseapi.com/v1/courses/${courseId}`,
+      { headers: { 'Authorization': `Key ${GOLFCOURSE_API_KEY}` } }
+    );
+
+    if (!gcaRes.ok) {
+      return res.status(404).json({ error: 'Course not found' });
+    }
+
+    const courseData = await gcaRes.json();
+    const lat = courseData.location?.latitude;
+    const lng = courseData.location?.longitude;
+
+    // Pick the first male tee set that has 18 holes, or just the first one
+    const tees = courseData.tees?.male || [];
+    const teeset = tees.find(t => t.number_of_holes === 18) || tees[0];
+    const gcaHoles = teeset?.holes || [];
+
+    // ── Step 2: OpenStreetMap — geometry ──────────────────────────────────────
+    let osmHoles = {};
+    if (lat && lng) {
+      osmHoles = await fetchOSMHoles(lat, lng);
+    }
+
+    // ── Step 3: Merge ─────────────────────────────────────────────────────────
+    const holes = [];
+    for (let i = 0; i < Math.max(gcaHoles.length, 18); i++) {
+      const holeNumber = i + 1;
+      const gca  = gcaHoles[i] || {};
+      const osm  = osmHoles[holeNumber] || {};
+
+      // Derive front/centre/back from green polygon if we have one
+      let frontLat = null, frontLng = null;
+      let centerLat = null, centerLng = null;
+      let backLat = null, backLng = null;
+
+      if (osm.greenPolygon && osm.greenPolygon.length >= 3) {
+        const c = centroid(osm.greenPolygon);
+        centerLat = c.lat;
+        centerLng = c.lng;
+        const fb = frontBack(osm.greenPolygon);
+        frontLat = fb.front.lat;
+        frontLng = fb.front.lng;
+        backLat  = fb.back.lat;
+        backLng  = fb.back.lng;
+      }
+
+      holes.push({
+        holeNumber,
+        par:          gca.par         ?? null,
+        yards:        gca.yardage     ?? null,
+        strokeIndex:  gca.handicap    ?? null,   // GolfCourseAPI calls it "handicap"
+        greenPolygon: osm.greenPolygon ?? [],
+        frontLat, frontLng,
+        centerLat, centerLng,
+        backLat, backLng,
+        teeLat:  osm.teeLat  ?? null,
+        teeLng:  osm.teeLng  ?? null,
+        hazards: osm.hazards ?? [],
+      });
+    }
+
+    res.json({
+      id:         courseData.id,
+      clubName:   courseData.club_name,
+      courseName: courseData.course_name,
+      latitude:   lat,
+      longitude:  lng,
+      par:        teeset?.par_total ?? null,
+      holes,
+    });
+
+  } catch (err) {
+    console.error('/api/courses/:id/holes error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch course holes' });
+  }
+});
+
+// ── OSM helpers ───────────────────────────────────────────────────────────────
+
+// Fetches golf features from OpenStreetMap Overpass API near the given coordinates.
+// Returns a map of holeNumber → { greenPolygon, teeLat, teeLng, hazards }
+async function fetchOSMHoles(lat, lng) {
+  const query = `
+    [out:json][timeout:30];
+    (
+      way["golf"="green"](around:1000,${lat},${lng});
+      way["golf"="tee"](around:1000,${lat},${lng});
+      way["golf"="bunker"](around:1000,${lat},${lng});
+      way["golf"="water_hazard"](around:1000,${lat},${lng});
+      way["golf"="lateral_water_hazard"](around:1000,${lat},${lng});
+    );
+    out geom;
+  `;
+
+  try {
+    const response = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      body:   query,
+      headers: { 'Content-Type': 'text/plain' }
+    });
+
+    if (!response.ok) {
+      console.warn('OSM Overpass returned', response.status);
+      return {};
+    }
+
+    const data = await response.json();
+    return parseOSMWays(data.elements || []);
+  } catch (err) {
+    console.warn('OSM fetch failed (non-fatal):', err.message);
+    return {};
+  }
+}
+
+// Parses OSM way elements into a holeNumber-keyed map.
+// OSM tags golf holes with `ref` (e.g. ref=7 means hole 7).
+function parseOSMWays(elements) {
+  const holes = {};
+
+  for (const el of elements) {
+    if (el.type !== 'way' || !el.geometry) continue;
+
+    const tags     = el.tags || {};
+    const golfType = tags['golf'];
+    const ref      = parseInt(tags['ref'] || tags['golf:hole'] || '0', 10);
+    const holeNum  = (ref >= 1 && ref <= 18) ? ref : null;
+
+    // Convert OSM geometry nodes to {lat, lng} pairs
+    const coords = el.geometry.map(n => ({ lat: n.lat, lng: n.lon }));
+    if (coords.length < 3) continue;
+
+    if (golfType === 'green' && holeNum) {
+      if (!holes[holeNum]) holes[holeNum] = { hazards: [] };
+      holes[holeNum].greenPolygon = coords;
+    }
+
+    if (golfType === 'tee' && holeNum) {
+      if (!holes[holeNum]) holes[holeNum] = { hazards: [] };
+      const c = centroid(coords);
+      holes[holeNum].teeLat = c.lat;
+      holes[holeNum].teeLng = c.lng;
+    }
+
+    if ((golfType === 'bunker' || golfType === 'water_hazard' || golfType === 'lateral_water_hazard') && holeNum) {
+      if (!holes[holeNum]) holes[holeNum] = { hazards: [] };
+      holes[holeNum].hazards.push({ type: golfType, polygon: coords });
+    }
+  }
+
+  return holes;
+}
+
+// Returns the centroid (average lat/lng) of a polygon.
+function centroid(coords) {
+  const lat = coords.reduce((s, c) => s + c.lat, 0) / coords.length;
+  const lng = coords.reduce((s, c) => s + c.lng, 0) / coords.length;
+  return { lat, lng };
+}
+
+// Returns the front (southernmost) and back (northernmost) points of a polygon.
+// Assumes the hole plays roughly north — good enough for v1.
+function frontBack(coords) {
+  const sorted = [...coords].sort((a, b) => a.lat - b.lat);
+  return { front: sorted[0], back: sorted[sorted.length - 1] };
+}
+
+// ── POST /api/insights ────────────────────────────────────────────────────────
 app.post('/api/insights', async (req, res) => {
   const { holes, handicap } = req.body;
   if (!holes || !Array.isArray(holes)) {
@@ -44,7 +268,6 @@ app.post('/api/insights', async (req, res) => {
   const fwCount    = holes.filter(h => h.fairwayHit).length;
   const avgPutts   = (holes.reduce((sum, h) => sum + (h.putts || 0), 0) / holes.length).toFixed(1);
 
-  // Build approach miss summary
   const approachHoles = holes.filter(h => h.approachX != null && h.approachY != null);
   let approachSummary = 'No approach data recorded.';
   if (approachHoles.length > 0) {
@@ -81,16 +304,6 @@ Respond with exactly 3 insights, each on a new line, numbered 1. 2. 3. No header
 });
 
 // ── POST /api/hole-strategy ───────────────────────────────────────────────────
-// Generates a single pre-hole tip based on the hole layout and the golfer's miss pattern.
-// Called when a Pro user loads each hole. Kept short to minimise latency.
-//
-// Request body:
-//   holeNumber: number
-//   par: number
-//   yards: number
-//   hazards: array of { type, label }
-//   missPattern: string (e.g. "63% of approaches short-left")
-//   handicap: number (optional)
 app.post('/api/hole-strategy', async (req, res) => {
   const { holeNumber, par, yards, hazards, missPattern, handicap } = req.body;
 
@@ -118,11 +331,6 @@ Give one specific, actionable tip for this hole.`;
 });
 
 // ── POST /api/season-review ───────────────────────────────────────────────────
-// Generates a 5-round trend summary for the Season Stats screen.
-//
-// Request body:
-//   rounds: array of { playedAt, score, par, girCount, fwCount, avgPutts, approachSummary }
-//   handicap: number (optional)
 app.post('/api/season-review', async (req, res) => {
   const { rounds, handicap } = req.body;
   if (!rounds || !Array.isArray(rounds)) {
@@ -159,5 +367,6 @@ Respond with exactly 5 insights, numbered 1-5, each on a new line. No headers.`;
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Flush Golf backend running on port ${PORT}`);
-  console.log(`SERVER_SECRET set: ${!!process.env.SERVER_SECRET}`);
+  console.log(`BACKEND_TOKEN set: ${!!process.env.BACKEND_TOKEN}`);
+  console.log(`GOLFCOURSE_API_KEY set: ${!!process.env.GOLFCOURSE_API_KEY}`);
 });
